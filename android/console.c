@@ -3041,6 +3041,109 @@ static const CommandDefRec  cbs_commands[] =
 /********************************************************************************************/
 /********************************************************************************************/
 /*****                                                                                 ******/
+/*****                         M O D E M   C O M M A N D                               ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static void
+help_modem_tech( ControlClient  client )
+{
+    int  nn;
+    control_write( client,
+            "'modem tech': allows you to display the current state of emulator modem.\r\n"
+            "'modem tech <technology>': allows you to change the technology of emulator modem.\r\n"
+            "'modem tech <technology> <mask>': allows you to change the technology and preferred mask of emulator modem.\r\n\r\n"
+            "valid values for <technology> are the following:\r\n\r\n" );
+
+    for (nn = 0; ; nn++) {
+        const char* name = android_get_modem_tech_name(nn);
+
+        if (!name) {
+            break;
+        }
+
+        control_write(client, "  %s\r\n", name);
+    }
+
+    control_write(client, "\r\nvalid values for <mask> are the following:\r\n\r\n");
+
+    for (nn = 0; ; nn++) {
+        const char* name = android_get_modem_preferred_mask_name(nn);
+
+        if (!name) {
+            break;
+        }
+
+        control_write(client, "  %s\r\n", name);
+    }
+}
+
+static int do_modem_tech_query( ControlClient client, char* args )
+{
+    AModemPreferredMask mask = amodem_get_preferred_mask(client->modem);
+    AModemTech technology = amodem_get_technology(client->modem);
+
+    control_write(client, "%s %s\r\n", android_get_modem_tech_name(technology),
+                                       android_get_modem_preferred_mask_name(mask));
+    return 0;
+}
+
+static int
+do_modem_tech( ControlClient client, char* args )
+{
+    char* pnext  = NULL;
+    AModemTech tech = A_TECH_UNKNOWN;
+    AModemPreferredMask mask = A_PREFERRED_MASK_UNKNOWN;
+
+    if (!client->modem) {
+        control_write(client, "KO: modem emulation not running\r\n");
+        return -1;
+    }
+
+    if (!args) {
+        return do_modem_tech_query(client, args);
+    }
+
+    // Parse <technology>
+    pnext = strchr(args, ' ');
+    if (pnext != NULL) {
+        *pnext++ = '\0';
+        while (*pnext && isspace(*pnext)) pnext++;
+    }
+
+    tech = android_parse_modem_tech(args);
+
+    if (tech == A_TECH_UNKNOWN) {
+        control_write(client, "KO: bad modem technology name, try 'help modem tech' for list of valid values\r\n");
+        return -1;
+    }
+
+    // Parse <mask>
+    if (pnext && *pnext) {
+        mask = android_parse_modem_preferred_mask(pnext);
+    }
+
+    if (amodem_set_technology(client->modem, tech, mask)) {
+        control_write(client, "KO: unable to set modem technology to '%s'\r\n", args);
+        return -1;
+    }
+
+    return 0;
+}
+
+static const CommandDefRec  modem_commands[] =
+{
+    { "tech", "query/switch modem technology",
+      NULL, help_modem_tech,
+      do_modem_tech, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
 /*****                           M A I N   C O M M A N D S                             ******/
 /*****                                                                                 ******/
 /********************************************************************************************/
@@ -3434,6 +3537,10 @@ static const CommandDefRec   main_commands[] =
     { "cbs", "Cell Broadcast related commands",
       "allows you to simulate an inbound CBS\r\n", NULL,
       NULL, cbs_commands },
+
+    { "modem", "Modem related commands",
+      "allows you to modify/retrieve modem info\r\n", NULL,
+      NULL, modem_commands },
 
     { NULL, NULL, NULL, NULL, NULL, NULL }
 };
