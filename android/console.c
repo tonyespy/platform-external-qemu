@@ -1620,6 +1620,8 @@ static const CommandDefRec  cdma_commands[] =
     { "prl_version", "Dump the current PRL version",
       NULL, NULL,
       do_cdma_prl_version, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 static const CommandDefRec  gsm_commands[] =
