@@ -26,7 +26,13 @@
 #include "sysemu.h"
 #include "android/android.h"
 #include "cpu.h"
+#include "hw/llcp.h"
+#include "hw/goldfish_bt.h"
 #include "hw/goldfish_device.h"
+#include "hw/goldfish_nfc.h"
+#include "hw/nfc-re.h"
+#include "hw/nfc.h"
+#include "hw/nfc-nci.h"
 #include "hw/power_supply.h"
 #include "shaper.h"
 #include "modem_driver.h"
@@ -100,6 +106,14 @@ typedef struct ControlClientRec_
     char                       buff[ 4096 ];
     int                        buff_len;
 
+    /**
+     * Currently referred modem device. Each control client have their own
+     * modem|bt device pointer to the one it's referring to. This pointer might
+     * be NULL so every command handler should check its validity every time
+     * referring to it. Its value is only modified by 'mux <type> <id>'.
+     */
+    AModem                     modem;
+    ABluetooth                 bt;
 } ControlClientRec;
 
 
@@ -331,6 +345,10 @@ control_client_create( Socket         socket,
         client->global  = global;
         client->sock    = socket;
         client->next    = global->clients;
+
+        client->modem   = amodem_get_instance(0);
+        client->bt      = abluetooth_get_instance(0);
+
         global->clients = client;
 
         qemu_set_fd_handler( socket, control_client_read, NULL, client );
@@ -727,8 +745,8 @@ do_network_speed( ControlClient  client, char*  args )
     netshaper_set_rate( slirp_shaper_in,  qemu_net_download_speed );
     netshaper_set_rate( slirp_shaper_out, qemu_net_upload_speed );
 
-    if (android_modem) {
-        amodem_set_data_network_type( android_modem,
+    if (client->modem) {
+        amodem_set_data_network_type( client->modem,
                                     android_parse_network_type( args ) );
     }
     return 0;
@@ -1069,6 +1087,11 @@ do_cdma_ssource( ControlClient  client, char*  args )
         return -1;
     }
 
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
     for (nn = 0; ; nn++) {
         const char*         name    = _cdma_subscription_sources[nn].name;
         ACdmaSubscriptionSource ssource = _cdma_subscription_sources[nn].source;
@@ -1077,7 +1100,7 @@ do_cdma_ssource( ControlClient  client, char*  args )
             break;
 
         if (!strcasecmp( args, name )) {
-            amodem_set_cdma_subscription_source( android_modem, ssource );
+            amodem_set_cdma_subscription_source( client->modem, ssource );
             return 0;
         }
     }
@@ -1096,9 +1119,14 @@ do_cdma_prl_version( ControlClient client, char * args )
         return -1;
     }
 
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
     version = strtol(args, &endptr, 0);
     if (endptr != args) {
-        amodem_set_cdma_prl_version( android_modem, version );
+        amodem_set_cdma_prl_version( client->modem, version );
     }
     return 0;
 }
@@ -1143,16 +1171,16 @@ do_gsm_status( ControlClient  client, char*  args )
         control_write( client, "KO: no argument required\r\n" );
         return -1;
     }
-    if (!android_modem) {
+    if (!client->modem) {
         control_write( client, "KO: modem emulation not running\r\n" );
         return -1;
     }
     control_write( client, "gsm voice state: %s\r\n",
                    gsm_state_to_string(
-                       amodem_get_voice_registration(android_modem) ) );
+                       amodem_get_voice_registration(client->modem) ) );
     control_write( client, "gsm data state:  %s\r\n",
                    gsm_state_to_string(
-                       amodem_get_data_registration(android_modem) ) );
+                       amodem_get_data_registration(client->modem) ) );
     return 0;
 }
 
@@ -1195,11 +1223,11 @@ do_gsm_data( ControlClient  client, char*  args )
             break;
 
         if ( !strcmp( args, name ) ) {
-            if (!android_modem) {
+            if (!client->modem) {
                 control_write( client, "KO: modem emulation not running\r\n" );
                 return -1;
             }
-            amodem_set_data_registration( android_modem, state );
+            amodem_set_data_registration( client->modem, state );
             qemu_net_disable = (state != A_REGISTRATION_HOME    &&
                                 state != A_REGISTRATION_ROAMING );
             return 0;
@@ -1247,11 +1275,11 @@ do_gsm_voice( ControlClient  client, char*  args )
             break;
 
         if ( !strcmp( args, name ) ) {
-            if (!android_modem) {
+            if (!client->modem) {
                 control_write( client, "KO: modem emulation not running\r\n" );
                 return -1;
             }
-            amodem_set_voice_registration( android_modem, state );
+            amodem_set_voice_registration( client->modem, state );
             return 0;
         }
     }
@@ -1259,6 +1287,35 @@ do_gsm_voice( ControlClient  client, char*  args )
     return -1;
 }
 
+static int
+do_gsm_location( ControlClient  client, char*  args )
+{
+    int lac, ci;
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    if (!args) {
+        amodem_get_gsm_location( client->modem, &lac, &ci );
+        control_write( client, "lac: %d\r\nci: %d\r\n", lac, ci );
+        return 0;
+    }
+
+    if (sscanf(args, "%u %u", &lac, &ci) != 2) {
+        control_write( client, "KO: missing argument, try 'gsm location <lac> <ci>'\r\n" );
+        return -1;
+    }
+
+    if ((lac > 0xFFFF) || (ci > 0xFFFFFFF)) {
+        control_write( client, "KO: invalid value\r\n" );
+        return -1;
+    }
+
+    amodem_set_gsm_location( client->modem, lac, ci );
+    return 0;
+}
 
 static int
 gsm_check_number( char*  args )
@@ -1278,6 +1335,23 @@ gsm_check_number( char*  args )
 }
 
 static int
+do_send_stkCmd( ControlClient  client, char*  args  )
+{
+    if (!args) {
+        control_write( client, "KO: missing argument, try 'stk pdu <hexstring>'\r\n" );
+        return -1;
+    }
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    amodem_send_stk_unsol_proactive_command( client->modem, args );
+    return 0;
+}
+
+static int
 do_gsm_call( ControlClient  client, char*  args )
 {
     /* check that we have a phone number made of digits */
@@ -1291,11 +1365,11 @@ do_gsm_call( ControlClient  client, char*  args )
         return -1;
     }
 
-    if (!android_modem) {
+    if (!client->modem) {
         control_write( client, "KO: modem emulation not running\r\n" );
         return -1;
     }
-    amodem_add_inbound_call( android_modem, args );
+    amodem_add_inbound_call( client->modem, args );
     return 0;
 }
 
@@ -1310,11 +1384,11 @@ do_gsm_cancel( ControlClient  client, char*  args )
         control_write( client, "KO: bad phone number format, use digits, # and + only\r\n" );
         return -1;
     }
-    if (!android_modem) {
+    if (!client->modem) {
         control_write( client, "KO: modem emulation not running\r\n" );
         return -1;
     }
-    if ( amodem_disconnect_call( android_modem, args ) < 0 ) {
+    if ( amodem_disconnect_call( client->modem, args ) < 0 ) {
         control_write( client, "KO: could not cancel this number\r\n" );
         return -1;
     }
@@ -1338,11 +1412,16 @@ call_state_to_string( ACallState  state )
 static int
 do_gsm_list( ControlClient  client, char*  args )
 {
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
     /* check that we have a phone number made of digits */
-    int   count = amodem_get_call_count( android_modem );
+    int   count = amodem_get_call_count( client->modem );
     int   nn;
     for (nn = 0; nn < count; nn++) {
-        ACall        call = amodem_get_call( android_modem, nn );
+        ACall        call = amodem_get_call( client->modem, nn );
         const char*  dir;
 
         if (call == NULL)
@@ -1368,12 +1447,18 @@ do_gsm_busy( ControlClient  client, char*  args )
         control_write( client, "KO: missing argument, try 'gsm busy <phonenumber>'\r\n" );
         return -1;
     }
-    call = amodem_find_call_by_number( android_modem, args );
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    call = amodem_find_call_by_number( client->modem, args );
     if (call == NULL || call->dir != A_CALL_OUTBOUND) {
         control_write( client, "KO: no current outbound call to number '%s' (call %p)\r\n", args, call );
         return -1;
     }
-    if ( amodem_disconnect_call( android_modem, args ) < 0 ) {
+    if ( amodem_remote_call_busy( client->modem, args ) < 0 ) {
         control_write( client, "KO: could not cancel this number\r\n" );
         return -1;
     }
@@ -1389,12 +1474,18 @@ do_gsm_hold( ControlClient  client, char*  args )
         control_write( client, "KO: missing argument, try 'gsm out hold <phonenumber>'\r\n" );
         return -1;
     }
-    call = amodem_find_call_by_number( android_modem, args );
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    call = amodem_find_call_by_number( client->modem, args );
     if (call == NULL) {
         control_write( client, "KO: no current call to/from number '%s'\r\n", args );
         return -1;
     }
-    if ( amodem_update_call( android_modem, args, A_CALL_HELD ) < 0 ) {
+    if ( amodem_update_call( client->modem, args, A_CALL_HELD ) < 0 ) {
         control_write( client, "KO: could put this call on hold\r\n" );
         return -1;
     }
@@ -1411,13 +1502,33 @@ do_gsm_accept( ControlClient  client, char*  args )
         control_write( client, "KO: missing argument, try 'gsm accept <phonenumber>'\r\n" );
         return -1;
     }
-    call = amodem_find_call_by_number( android_modem, args );
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    call = amodem_find_call_by_number( client->modem, args );
     if (call == NULL) {
         control_write( client, "KO: no current call to/from number '%s'\r\n", args );
         return -1;
     }
-    if ( amodem_update_call( android_modem, args, A_CALL_ACTIVE ) < 0 ) {
+    if ( amodem_update_call( client->modem, args, A_CALL_ACTIVE ) < 0 ) {
         control_write( client, "KO: could not activate this call\r\n" );
+        return -1;
+    }
+    return 0;
+}
+
+static int
+do_gsm_clear( ControlClient client, char* args)
+{
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+    if ( amodem_clear_call( client->modem ) < 0 ) {
+        control_write( client, "KO: could not clear up modem\r\n" );
         return -1;
     }
     return 0;
@@ -1432,9 +1543,18 @@ do_gsm_signal( ControlClient  client, char*  args )
       int     params[ NUM_SIGNAL_PARAMS ];
 
       static  int  last_ber = 99;
+      int     rssi, ber;
 
-      if (!p)
-          p = "";
+      if (!client->modem) {
+          control_write( client, "KO: modem emulation not running\r\n" );
+          return -1;
+      }
+
+      if (!p) {
+          amodem_get_signal_strength( client->modem, &rssi, &ber );
+          control_write( client, "rssi = %d\r\nber = %d\r\n", rssi, ber );
+          return 0;
+      }
 
       /* tokenize */
       while (*p) {
@@ -1461,7 +1581,7 @@ do_gsm_signal( ControlClient  client, char*  args )
           return -1;
       }
 
-      int rssi = params[SIGNAL_RSSI];
+      rssi = params[SIGNAL_RSSI];
       if ((rssi < 0 || rssi > 31) && rssi != 99) {
           control_write( client, "KO: invalid RSSI - must be 0..31 or 99\r\n");
           return -1;
@@ -1469,7 +1589,7 @@ do_gsm_signal( ControlClient  client, char*  args )
 
       /* check ber is 0..7 or 99 */
       if (top_param >= SIGNAL_BER) {
-          int ber = params[SIGNAL_BER];
+          ber = params[SIGNAL_BER];
           if ((ber < 0 || ber > 7) && ber != 99) {
               control_write( client, "KO: invalid BER - must be 0..7 or 99\r\n");
               return -1;
@@ -1477,11 +1597,109 @@ do_gsm_signal( ControlClient  client, char*  args )
           last_ber = ber;
       }
 
-      amodem_set_signal_strength( android_modem, rssi, last_ber );
+      amodem_set_signal_strength( client->modem, rssi, last_ber );
 
       return 0;
   }
 
+static int
+do_gsm_lte_signal( ControlClient  client, char*  args )
+{
+      enum { LTE_SIGNAL_RXLEV = 0, LTE_SIGNAL_RSRP, LTE_SIGNAL_RSSNR, NUM_LTE_SIGNAL_PARAMS };
+      char*   p = args;
+      int     top_param = -1;
+      int     params[ NUM_LTE_SIGNAL_PARAMS ];
+      int     rxlev, rsrp, rssnr;
+
+      if (!client->modem) {
+          control_write( client, "KO: modem emulation not running\r\n" );
+          return -1;
+      }
+
+      if (!p) {
+          amodem_get_lte_signal_strength( client->modem, &rxlev, &rsrp, &rssnr );
+          control_write( client, "rxlev = %d\r\nrsrp = %d\r\nrssnr = %d\r\n", rxlev, rsrp, rssnr );
+          return 0;
+      }
+
+      /* tokenize */
+      while (*p) {
+          char*   end;
+          int  val = strtol( p, &end, 10 );
+
+          if (end == p) {
+              control_write( client, "KO: argument '%s' is not a number\n", p );
+              return -1;
+          }
+
+          params[++top_param] = val;
+          if (top_param + 1 == NUM_LTE_SIGNAL_PARAMS)
+              break;
+
+          p = end;
+          while (*p && (p[0] == ' ' || p[0] == '\t'))
+              p += 1;
+      }
+
+      /* sanity check */
+      if (top_param < LTE_SIGNAL_RSSNR) {
+          control_write( client, "KO: not enough arguments: see 'help gsm lte_signal' for details\r\n" );
+          return -1;
+      }
+
+      rxlev = params[LTE_SIGNAL_RXLEV];
+      if ((rxlev < 0 || rxlev > 63) && rxlev != 99) {
+          control_write( client, "KO: invalid rxlev - must be 0..63 or 99\r\n");
+          return -1;
+      }
+
+      rsrp = params[LTE_SIGNAL_RSRP];
+      if ((rsrp < 44 || rsrp > 140) && rsrp != 65535) {
+          control_write( client, "KO: invalid rsrp - must be 44..140 or 65535\r\n");
+          return -1;
+      }
+
+      rssnr = params[LTE_SIGNAL_RSSNR];
+      if ((rssnr < -200 || rssnr > 300) && rssnr != 65535) {
+          control_write( client, "KO: invalid rssnr - must be -200..300 or 65535\r\n");
+          return -1;
+      }
+
+      amodem_set_lte_signal_strength( client->modem, rxlev, rsrp, rssnr );
+
+      return 0;
+}
+
+static void
+do_gsm_report_creg( ControlClient  client, char*  args)
+{
+    ARegistrationUnsolMode creg = amodem_get_voice_unsol_mode(client->modem);
+
+    control_write( client, "+CREG: %d\r\n", creg);
+}
+
+static int
+do_gsm_report( ControlClient  client, char*  args )
+{
+    char* field;
+
+    if (args) {
+        field = strsep(&args, " ");
+    } else {
+        field = NULL;
+    }
+
+    do {
+        if (!field || !strcmp(field, "creg")) {
+            do_gsm_report_creg(client, args);
+            if (field) {
+                break;
+            }
+        }
+    } while (field);
+
+    return 0;
+}
 
 #if 0
 static const CommandDefRec  gsm_in_commands[] =
@@ -1514,6 +1732,8 @@ static const CommandDefRec  cdma_commands[] =
     { "prl_version", "Dump the current PRL version",
       NULL, NULL,
       do_cdma_prl_version, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
 };
 
 static const CommandDefRec  gsm_commands[] =
@@ -1541,6 +1761,10 @@ static const CommandDefRec  gsm_commands[] =
     "if the call is in the 'waiting' or 'held' state\r\n", NULL,
     do_gsm_accept, NULL },
 
+    { "clear", "clear current phone calls",
+    "'gsm clear' cleans up all inbound and outbound calls\r\n", NULL,
+    do_gsm_clear, NULL },
+
     { "cancel", "disconnect an inbound or outbound phone call",
     "'gsm cancel <phonenumber>' allows you to simulate the end of an inbound or outbound call\r\n", NULL,
     do_gsm_cancel, NULL },
@@ -1556,10 +1780,27 @@ static const CommandDefRec  gsm_commands[] =
     do_gsm_status, NULL },
 
     { "signal", "set sets the rssi and ber",
-    "'gsm signal <rssi> [<ber>]' changes the reported strength and error rate on next (15s) update.\r\n"
+    "'gsm signal [<rssi> [<ber>]]' changes the reported strength and error rate on next (15s) update.\r\n"
     "rssi range is 0..31 and 99 for unknown\r\n"
     "ber range is 0..7 percent and 99 for unknown\r\n",
     NULL, do_gsm_signal, NULL },
+
+    { "lte_signal", "set sets the LTE rxlev, rsrp and rssnr",
+    "'gsm lte_signal [<rxlev> <rsrp> <rssnr>]' changes the reported LTE rxlev, rsrp and rssnr.\r\n"
+    "rxlev range is 0..63 and 99 for unknown\r\n"
+    "rsrp range is 44..140 dBm and 65535 for invalid\r\n"
+    "rssnr range is -200..300 dB and 65535 for invalid\r\n",
+    NULL, do_gsm_lte_signal, NULL },
+
+    { "location", "set lac/ci",
+    "'gsm location [<lac> <ci>]' sets or gets the location area code and cell identification.\r\n"
+    "lac range is 0..65535 and ci range is 0..268435455\r\n",
+    NULL, do_gsm_location, NULL},
+
+    { "report", "report Modem status",
+    "'gsm report'      report all known fields\r\n"
+    "'gsm report creg' report CREG field\r\n",
+    NULL, do_gsm_report, NULL},
 
     { NULL, NULL, NULL, NULL, NULL, NULL }
 };
@@ -1613,7 +1854,7 @@ do_sms_send( ControlClient  client, char*  args )
         return -1;
     }
 
-    if (!android_modem) {
+    if (!client->modem) {
         control_write( client, "KO: modem emulation not running\r\n" );
         return -1;
     }
@@ -1626,7 +1867,7 @@ do_sms_send( ControlClient  client, char*  args )
     }
 
     for (nn = 0; pdus[nn] != NULL; nn++)
-        amodem_receive_sms( android_modem, pdus[nn] );
+        amodem_receive_sms( client->modem, pdus[nn] );
 
     smspdu_free_list( pdus );
     return 0;
@@ -1643,7 +1884,7 @@ do_sms_sendpdu( ControlClient  client, char*  args )
         return -1;
     }
 
-    if (!android_modem) {
+    if (!client->modem) {
         control_write( client, "KO: modem emulation not running\r\n" );
         return -1;
     }
@@ -1654,8 +1895,43 @@ do_sms_sendpdu( ControlClient  client, char*  args )
         return -1;
     }
 
-    amodem_receive_sms( android_modem, pdu );
+    amodem_receive_sms( client->modem, pdu );
     smspdu_free( pdu );
+    return 0;
+}
+
+static int
+do_sms_smsc( ControlClient  client, char*  args )
+{
+    int           ret = 0;
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    if (!args) {
+        // Get
+        SmsAddress pSmscRec;
+        char       smsc[32] = {0};
+
+        pSmscRec = amodem_get_smsc_address( client->modem );
+        ret = sms_address_to_str( pSmscRec, smsc, sizeof(smsc) - 1);
+        if (!ret) {
+            control_write( client, "KO: SMSC address unvailable\r\n" );
+            return -1;
+        }
+
+        control_write( client, "\"%s\",%u\r\n", smsc, pSmscRec->toa );
+        return 0;
+    }
+
+    // Set
+    if (amodem_set_smsc_address( client->modem, args, 0 )) {
+        control_write( client, "KO: Failed to set SMSC address\r\n" );
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1670,6 +1946,20 @@ static const CommandDefRec  sms_commands[] =
     "(used internally when one emulator sends SMS messages to another instance).\r\n"
     "you probably don't want to play with this at all\r\n", NULL,
     do_sms_sendpdu, NULL },
+
+    { "smsc", "get/set smsc address",
+    "'sms smsc <smscaddress>' allows you to simulate set smsc address\r\n"
+    "'sms smsc' allows you to simulate get smsc address\r\n", NULL,
+    do_sms_smsc, NULL},
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+static const CommandDefRec stk_commands[] =
+{
+    { "pdu", "issue stk proactive command",
+    "'stk pdu <hexstring>' allows you to issue stk PDU to simulate an unsolicted proactive command \r\n", NULL,
+    do_send_stkCmd, NULL },
 
     { NULL, NULL, NULL, NULL, NULL, NULL }
 };
@@ -2605,6 +2895,1078 @@ static const CommandDefRec sensor_commands[] =
 /********************************************************************************************/
 /********************************************************************************************/
 /*****                                                                                 ******/
+/*****             T E L E P H O N Y   O P E R A T O R   C O M M A N D S               ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static int
+do_operator_dumpall( ControlClient client, char* args )
+{
+    int oper_index = 0, name_index, pos = 0, n;
+    char replybuf[64];
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    for (; oper_index < A_OPERATOR_MAX; oper_index++) {
+        for (name_index = 0; name_index < A_NAME_MAX; name_index++) {
+            n = amodem_get_operator_name_ex(client->modem,
+                                            oper_index, name_index,
+                                            replybuf + pos, sizeof(replybuf) - pos);
+            if (n) {
+                --n;
+            }
+            pos += n;
+            replybuf[pos++] = ',';
+        }
+        replybuf[pos - 1] = '\n';
+    }
+    replybuf[pos] = '\0';
+
+    control_write(client, replybuf);
+
+    return 0;
+}
+
+static int
+do_operator_get( ControlClient client, char* args )
+{
+    if (!args) {
+        control_write(client, "KO: Usage: operator get <operator index>\n");
+        return -1;
+    }
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    int oper_index = A_OPERATOR_MAX;
+    if ((sscanf(args, "%u", &oper_index) != 1) ||
+        (oper_index >= A_OPERATOR_MAX)) {
+        control_write(client, "KO: invalid operator index\n");
+        return -1;
+    }
+
+    int name_index = 0, pos = 0, n;
+    char replybuf[64];
+    for (; name_index < A_NAME_MAX; name_index++) {
+        n = amodem_get_operator_name_ex(client->modem,
+                                        oper_index, name_index,
+                                        replybuf + pos, sizeof(replybuf) - pos);
+        if (n) {
+            --n;
+        }
+        pos += n;
+        replybuf[pos++] = ',';
+    }
+    replybuf[pos - 1] = '\n';
+    replybuf[pos] = '\0';
+
+    control_write(client, replybuf);
+
+    return 0;
+}
+
+static int
+do_operator_set( ControlClient client, char* args )
+{
+    char* args_dup = NULL;
+
+    if (!args) {
+USAGE:
+        control_write(client, "Usage: operator set <operator index> <long name>[,<short name>[,<mcc mnc>]]\n");
+FREE_BUF:
+        if (args_dup) free(args_dup);
+        return -1;
+    }
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    args_dup = strdup(args);
+    if (args_dup == NULL) {
+        control_write( client, "KO: Memory allocation failed.\n" );
+        return -1;
+    }
+
+    char* p = args_dup;
+    /* Skip leading white spaces. */
+    while (*p && isspace(*p)) p++;
+    if (!*p) goto USAGE;
+
+    int oper_index = 0;
+    if ((sscanf(args, "%u", &oper_index) != 1)
+        || (oper_index >= A_OPERATOR_MAX)) {
+        control_write(client, "KO: invalid operator index\n");
+        goto FREE_BUF;
+    }
+
+    /* Skip operator index. */
+    while (*p && !isspace(*p)) p++;
+    if (!*p) goto USAGE;
+    /* Skip white spaces. */
+    while (*p && isspace(*p)) p++;
+    if (!*p) goto USAGE;
+
+    char* longName = p;
+    char* shortName = NULL;
+    char* mccMnc = NULL;
+
+    p = strchr(p, ',');
+    if (p) {
+      *p = '\0';
+
+      shortName = ++p;
+      p = strchr(p, ',');
+      if (p) {
+        *p = '\0';
+	mccMnc = ++p;
+      }
+    }
+
+    amodem_set_operator_name_ex(client->modem, oper_index, A_NAME_LONG, longName, -1);
+    if (shortName) {
+      amodem_set_operator_name_ex(client->modem, oper_index, A_NAME_SHORT, shortName, -1);
+    }
+    if (mccMnc) {
+      amodem_set_operator_name_ex(client->modem, oper_index, A_NAME_NUMERIC, mccMnc, -1);
+    }
+
+    // Notify device through amodem_unsol(...)
+    amodem_set_voice_registration(client->modem, amodem_get_voice_registration(client->modem));
+
+    do_operator_dumpall(client, NULL);
+
+    if (args_dup) {
+      free(args_dup);
+    }
+    return 0;
+}
+
+static const CommandDefRec  operator_commands[] =
+{
+    { "dumpall", "dump all operators info",
+      "'dumpall': dump all operators and their long/short names, mcc and mnc.\r\n",
+      NULL, do_operator_dumpall, NULL },
+
+    { "get", "get operator info by index",
+      "'get <operator index>' get the values of specified operator.\r\n",
+      NULL, do_operator_get, NULL},
+
+    { "set", "set operator info by index",
+      "'set <operator index> <long name>[,<short name>[,<mcc mnc>]]' set the values of specified operator.\r\n",
+      NULL, do_operator_set, NULL},
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                            M U X   C O M M A N D S                              ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static int
+do_mux_modem( ControlClient client, char* args )
+{
+    if (!args) {
+        if (!client->modem) {
+            control_write( client, "KO: modem emulation not running\r\n" );
+            return -1;
+        }
+
+        control_write( client, "%d\n", amodem_get_instance_id(client->modem) );
+        return 0;
+    }
+
+    unsigned int instance_id = 0;
+    if ((sscanf(args, "%u", &instance_id) != 1)
+            || (instance_id >= amodem_num_devices)) {
+        control_write(client, "Usage: mux modem [<instance index>]\n");
+        return -1;
+    }
+
+    AModem modem = amodem_get_instance(instance_id);
+    if (!modem) {
+        /**
+         * Just give a warning message here and still allows selecting an
+         * invalid modem. Because when it comes to inter-emulator communication
+         * and the selection fails here and fallback to original modem, it will
+         * send wrong command to wrong modem and causes unexpected behaviour.
+         */
+        control_write(client, "WARNING: Modem[%u] is not enabled\n", instance_id);
+    }
+
+    client->modem = modem;
+    return 0;
+}
+
+static int
+do_mux_bt_list( ControlClient client )
+{
+    int id;
+    ABluetooth bt;
+
+    id = 0;
+    while ((bt = abluetooth_get_instance(id++)) != NULL) {
+        struct bt_device_s *dev;
+        char buf[BDADDR_BUF_LEN];
+
+        dev = abluetooth_get_bt_device(bt);
+        if (dev) {
+            ba_to_str(buf, &dev->bd_addr);
+        }
+        control_write(client, "%c %s\n",
+                      (client->bt == bt ? '*' : 'L'),
+                      (dev ? buf : "(null)"));
+    }
+
+    return 0;
+}
+
+static int
+do_mux_bt_set( ControlClient client, char* args )
+{
+    ABluetooth bt;
+    bdaddr_t addr;
+
+    bt = NULL;
+    if (!ba_from_str(&addr, args)) {
+        ABluetooth candidate;
+        int id = 0;
+
+        while ((candidate = abluetooth_get_instance(id++)) != NULL) {
+            struct bt_device_s *dev;
+
+            dev = abluetooth_get_bt_device(candidate);
+            if (dev && !bacmp(&addr, &dev->bd_addr)) {
+                bt = candidate;
+                break;
+            }
+        }
+    }
+
+    if (!bt) {
+        control_write(client, "WARNING: device '%s' is not available\n", args);
+    }
+
+    client->bt = bt;
+    return do_mux_bt_list(client);
+}
+
+static int
+do_mux_bt( ControlClient client, char* args )
+{
+    return args ? do_mux_bt_set(client, args) : do_mux_bt_list(client);
+}
+
+static const CommandDefRec  mux_commands[] =
+{
+    { "modem", "select active modem device",
+      "'modem <instance index>': select active modem device by instance for further config.\r\n"
+      "'modem': display current active modem device.\r\n", NULL,
+      do_mux_modem, NULL},
+
+    { "bt", "select active bluetooth device",
+      "'bt <instance index>': select active bluetooth device by instance for further config.\r\n"
+      "'bt': display current active bluetooth device.\r\n", NULL,
+      do_mux_bt, NULL},
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                           C B S   C O M M A N D                                 ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static int
+do_cbs_sendpdu( ControlClient  client, char*  args )
+{
+    SmsPDU pdu;
+
+    /* check that we have a phone number made of digits */
+    if (!args) {
+        control_write( client, "KO: missing argument, try 'cbs pdu <hexstring>'\r\n" );
+        return -1;
+    }
+
+    if (!client->modem) {
+        control_write( client, "KO: modem emulation not running\r\n" );
+        return -1;
+    }
+
+    pdu = cbspdu_create_from_hex( args, strlen(args) );
+    if (pdu == NULL) {
+        control_write( client, "KO: badly formatted <hexstring>\r\n" );
+        return -1;
+    }
+
+    amodem_receive_cbs( client->modem, pdu );
+    smspdu_free( pdu );
+    return 0;
+}
+
+static const CommandDefRec  cbs_commands[] =
+{
+    { "pdu", "send inbound Cell Broadcast PDU",
+    "'cbs pdu <hexstring>' allows you to simulate a new inbound Cell Broadcast PDU\r\n"
+    "you probably love to play with this ;)\r\n", NULL,
+    do_cbs_sendpdu, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                         R F K I L L    C O M M A N D S                          ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static const char* rfkill_type_names[RFKILL_TYPE_MAX] = {
+    /* see hw/goldfish_bt.h, enum RfkillTypes */
+    "wlan", "bluetooth", "uwb", "wimax", "wwan"
+};
+
+static RfkillTypes
+get_rfkill_type_by_name( const char*  name, size_t  len )
+{
+    int type;
+
+    for (type = 0; type < RFKILL_TYPE_MAX; type++) {
+        if (!strncmp(name, rfkill_type_names[type], len)) {
+            return type;
+        }
+    }
+
+    return RFKILL_TYPE_MAX;
+}
+
+static int
+do_rfkill_state( ControlClient  client, char*  args )
+{
+    char buf[32];
+    const char *name;
+    uint32_t blocking, hw_block, mask;
+    int type, state;
+
+    blocking = android_rfkill_get_blocking();
+    hw_block = android_rfkill_get_hardware_block();
+
+    if (args) {
+        type = get_rfkill_type_by_name(args, strlen(args));
+        if (type == RFKILL_TYPE_MAX) {
+            control_write( client, "KO: unknown <type>\r\n" );
+            return -1;
+        }
+
+        mask = RFKILL_TYPE_BIT(type);
+        state = hw_block & mask ? 2 : (blocking & mask ? 0 : 1);
+        snprintf(buf, sizeof buf, "%d\r\n", state);
+        control_write( client, buf );
+        return 0;
+    }
+
+    for (type = 0; type < RFKILL_TYPE_MAX; type++) {
+        name = rfkill_type_names[type];
+        mask = RFKILL_TYPE_BIT(type);
+        state = hw_block & mask ? 2 : (blocking & mask ? 0 : 1);
+        snprintf(buf, sizeof buf, "%s: %d\r\n", name, state);
+        control_write( client, buf );
+    }
+
+    return 0;
+}
+
+static int
+do_rfkill_block( ControlClient  client, char*  args )
+{
+    char *p;
+    int type = RFKILL_TYPE_MAX;
+    uint32_t hw_block;
+
+    if (args) {
+        p = strchr(args, ' ');
+        int len = p ? (p - args) : strlen(args);
+        type = get_rfkill_type_by_name(args, len);
+    }
+
+    if (type == RFKILL_TYPE_MAX) {
+        control_write( client, "KO: unknown <type>\r\n" );
+        return -1;
+    }
+
+    hw_block = android_rfkill_get_hardware_block();
+
+    if (p) {
+        while (*p && isspace(*p)) p++;
+
+        if (!strcmp(p, "on")) {
+            hw_block |= RFKILL_TYPE_BIT(type);
+        } else if (!strcmp(p, "off")) {
+            hw_block &= ~RFKILL_TYPE_BIT(type);
+        } else {
+            control_write( client, "KO: unknown <value>\r\n" );
+            return -1;
+        }
+    } else {
+        hw_block |= RFKILL_TYPE_BIT(type);
+    }
+
+    android_rfkill_set_hardware_block(hw_block);
+
+    return 0;
+}
+
+static const CommandDefRec  rfkill_commands[] =
+{
+    { "state", "get current blocking state",
+      "'rfkill state [<type>]' echo blocking status of all or specified <type>. '0' as\r\n"
+      "software blocked, '1' as unblocked, '2' as hardware blocked.\r\n", NULL,
+      do_rfkill_state, NULL },
+
+    { "block", "set hardware block",
+      "'rfkill block <type>[ <value>]' turn on/off hardware block on specified <type>.\r\n", NULL,
+      do_rfkill_block, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                            N F C    C O M M A N D S                             ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+struct nfc_ntf_param {
+    ControlClient client;
+    struct nfc_re* re;
+    unsigned long ntype;
+    long rf;
+};
+
+#define NFC_NTF_PARAM_INIT(_client) \
+    { \
+      .client = (_client), \
+      .re = NULL, \
+      .ntype = 0, \
+      .rf = -1 \
+    }
+
+static ssize_t
+nfc_rf_discovery_ntf_cb(void* data,
+                        struct nfc_device* nfc, size_t maxlen,
+                        union nci_packet* ntf)
+{
+    ssize_t res;
+    const struct nfc_ntf_param* param = data;
+    res = nfc_create_rf_discovery_ntf(param->re, param->ntype, nfc, ntf);
+    if (res < 0) {
+        control_write(param->client, "KO: rf_discover failed\r\n");
+        return -1;
+    }
+    return res;
+}
+
+static ssize_t
+nfc_rf_intf_activated_ntf_cb(void* data,
+                             struct nfc_device* nfc, size_t maxlen,
+                             union nci_packet* ntf)
+{
+    size_t res;
+    struct nfc_ntf_param* param = data;
+    if (!param->re) {
+        if (!nfc->active_re) {
+            control_write(param->client, "KO: no active remote-endpoint\n");
+            return -1;
+        }
+        param->re = nfc->active_re;
+    }
+    if (nfc->active_rf) {
+        // Already select an active rf interface,so do nothing.
+    } else if (param->rf == -1) {
+        // Auto select active rf interface based on remote-endpoint protocol.
+        enum nci_rf_interface iface;
+
+        switch(param->re->rfproto) {
+            case NCI_RF_PROTOCOL_T1T:
+            case NCI_RF_PROTOCOL_T2T:
+            case NCI_RF_PROTOCOL_T3T:
+                iface = NCI_RF_INTERFACE_FRAME;
+                break;
+            case NCI_RF_PROTOCOL_NFC_DEP:
+                iface = NCI_RF_INTERFACE_NFC_DEP;
+                break;
+            case NCI_RF_PROTOCOL_ISO_DEP:
+                iface = NCI_RF_INTERFACE_ISO_DEP;
+                break;
+            default:
+                control_write(param->client,
+                              "KO: invalid remote-endpoint protocol '%d'\n",
+                              param->re->rfproto);
+                return -1;
+        }
+
+        nfc->active_rf = nfc_find_rf_by_rf_interface(nfc, iface);
+        if (!nfc->active_rf) {
+            control_write(param->client, "KO: no active rf interface\r\n");
+            return -1;
+        }
+    } else {
+        nfc->active_rf = nfc->rf + param->rf;
+    }
+    res = nfc_create_rf_intf_activated_ntf(param->re, nfc, ntf);
+    if (res < 0) {
+        control_write(param->client, "KO: rf_intf_activated failed\r\n");
+        return -1;
+    }
+    return res;
+}
+
+static int
+do_nfc_ntf( ControlClient  client, char*  args )
+{
+    char *p;
+
+    if (!args) {
+        control_write(client, "KO: no arguments given\r\n");
+        return -1;
+    }
+
+    /* read notification type */
+    p = strsep(&args, " ");
+    if (!p) {
+        control_write(client, "KO: no operation given\r\n");
+        return -1;
+    }
+    if (!strcmp(p, "rf_discover")) {
+        size_t i;
+        struct nfc_ntf_param param = NFC_NTF_PARAM_INIT(client);
+        /* read remote-endpoint index */
+        p = strsep(&args, " ");
+        if (!p) {
+            control_write(client, "KO: no remote endpoint given\r\n");
+            return -1;
+        }
+        errno = 0;
+        i = strtoul(p, NULL, 0);
+        if (errno) {
+            control_write(client,
+                          "KO: invalid remote endpoint '%s', error %d(%s)\r\n",
+                          p, errno, strerror(errno));
+            return -1;
+        }
+        if (!(i < sizeof(nfc_res)/sizeof(nfc_res[0])) ) {
+            control_write(client, "KO: unknown remote endpoint %zu\r\n", i);
+            return -1;
+        }
+
+        /* read discover notification type */
+        p = strsep(&args, " ");
+        if (!p) {
+            control_write(client, "KO: no discover notification type given\r\n");
+            return -1;
+        }
+        errno = 0;
+        param.ntype = strtoul(p, NULL, 0);
+        if (errno) {
+            control_write(client,
+                          "KO: invalid discover notification type '%s', error %d(%s)\r\n",
+                          p, errno, strerror(errno));
+            return -1;
+        }
+        if (!(param.ntype < NUMBER_OF_NCI_NOTIFICATION_TYPES)) {
+            control_write(client, "KO: unknown discover notification type %zu\r\n", param.ntype);
+            return -1;
+        }
+        param.re = nfc_res + i;
+        /* generate RF_DISCOVER_NTF */
+        if (goldfish_nfc_send_ntf(nfc_rf_discovery_ntf_cb, &param) < 0) {
+            /* error message generated in create function */
+            return -1;
+        }
+    } else if (!strcmp(p, "rf_intf_activated")) {
+        struct nfc_ntf_param param = NFC_NTF_PARAM_INIT(client);
+        /* read remote-endpoint index */
+        p = strsep(&args, " ");
+        if (p) {
+            size_t i;
+            errno = 0;
+            i = strtoul(p, NULL, 0);
+            if (errno) {
+                control_write(client,
+                              "KO: invalid remote endpoint '%s', error %d(%s)\r\n",
+                              p, errno, strerror(errno));
+                return -1;
+            }
+            if (!(i < sizeof(nfc_res)/sizeof(nfc_res[0]))) {
+                control_write(client, "KO: unknown remote endpoint %zu\r\n", i);
+                return -1;
+            }
+            param.re = nfc_res + i;
+
+            /* read rf interface index */
+            p = strsep(&args, " ");
+            if (!p) {
+                param.rf = -1;
+            } else {
+                errno = 0;
+                param.rf = strtol(p, NULL, 0);
+                if (errno) {
+                    control_write(client,
+                                  "KO: invalid rf index '%s', error %d(%s)\r\n",
+                                  p, errno, strerror(errno));
+                    return -1;
+                }
+                if (param.rf < -1 ||
+                    param.rf >= NUMBER_OF_SUPPORTED_NCI_RF_INTERFACES) {
+                    control_write(client, "KO: unknown rf index %d\r\n", param.rf);
+                    return -1;
+                }
+            }
+        } else {
+            param.re = NULL;
+            param.rf = -1;
+        }
+        /* generate RF_INTF_ACTIVATED_NTF; if param.re == NULL,
+         * active RE will be used */
+        if (goldfish_nfc_send_ntf(nfc_rf_intf_activated_ntf_cb, &param) < 0) {
+            /* error message generated in create function */
+            return -1;
+        }
+    } else {
+        control_write(client, "KO: invalid operation '%s'\r\n", p);
+        return -1;
+    }
+
+    return 0;
+}
+
+static const CommandDefRec  nfc_commands[] =
+{
+    { "ntf", "send NCI notification",
+      "'nfc ntf rf_discover <i> <type>' send RC_DISCOVER_NTF for Remote Endpoint <i> with notification type <type>\r\n"
+      "'nfc ntf rf_intf_activated' send RC_DISCOVER_NTF for selected Remote Endpoint\r\n"
+      "'nfc ntf rf_intf_activated <i>' send RC_DISCOVER_NTF for Remote Endpoint <i>, auto detect rf\r\n"
+      "'nfc ntf rf_intf_activated <i> -1' send RC_DISCOVER_NTF for Remote Endpoint <i>, auto detect rf\r\n"
+      "'nfc ntf rf_intf_activated <i> <j>' send RC_DISCOVER_NTF for Remote Endpoint <i> & RF interface <j>\r\n",
+      NULL,
+      do_nfc_ntf, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                         M O D E M   C O M M A N D                               ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static void
+help_modem_tech( ControlClient  client )
+{
+    int  nn;
+    control_write( client,
+            "'modem tech': allows you to display the current state of emulator modem.\r\n"
+            "'modem tech <technology>': allows you to change the technology of emulator modem.\r\n"
+            "'modem tech <technology> <mask>': allows you to change the technology and preferred mask of emulator modem.\r\n\r\n"
+            "valid values for <technology> are the following:\r\n\r\n" );
+
+    for (nn = 0; ; nn++) {
+        const char* name = android_get_modem_tech_name(nn);
+
+        if (!name) {
+            break;
+        }
+
+        control_write(client, "  %s\r\n", name);
+    }
+
+    control_write(client, "\r\nvalid values for <mask> are the following:\r\n\r\n");
+
+    for (nn = 0; ; nn++) {
+        const char* name = android_get_modem_preferred_mask_name(nn);
+
+        if (!name) {
+            break;
+        }
+
+        control_write(client, "  %s\r\n", name);
+    }
+}
+
+static int do_modem_tech_query( ControlClient client, char* args )
+{
+    AModemPreferredMask mask = amodem_get_preferred_mask(client->modem);
+    AModemTech technology = amodem_get_technology(client->modem);
+
+    control_write(client, "%s %s\r\n", android_get_modem_tech_name(technology),
+                                       android_get_modem_preferred_mask_name(mask));
+    return 0;
+}
+
+static int
+do_modem_tech( ControlClient client, char* args )
+{
+    char* pnext  = NULL;
+    AModemTech tech = A_TECH_UNKNOWN;
+    AModemPreferredMask mask = A_PREFERRED_MASK_UNKNOWN;
+
+    if (!client->modem) {
+        control_write(client, "KO: modem emulation not running\r\n");
+        return -1;
+    }
+
+    if (!args) {
+        return do_modem_tech_query(client, args);
+    }
+
+    // Parse <technology>
+    pnext = strchr(args, ' ');
+    if (pnext != NULL) {
+        *pnext++ = '\0';
+        while (*pnext && isspace(*pnext)) pnext++;
+    }
+
+    tech = android_parse_modem_tech(args);
+
+    if (tech == A_TECH_UNKNOWN) {
+        control_write(client, "KO: bad modem technology name, try 'help modem tech' for list of valid values\r\n");
+        return -1;
+    }
+
+    // Parse <mask>
+    if (pnext && *pnext) {
+        mask = android_parse_modem_preferred_mask(pnext);
+    }
+
+    if (amodem_set_technology(client->modem, tech, mask)) {
+        control_write(client, "KO: unable to set modem technology to '%s'\r\n", args);
+        return -1;
+    }
+
+    return 0;
+}
+
+static const CommandDefRec  modem_commands[] =
+{
+    { "tech", "query/switch modem technology",
+      NULL, help_modem_tech,
+      do_modem_tech, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
+/*****                      B L U E T O O T H   C O M M A N D S                        ******/
+/*****                                                                                 ******/
+/********************************************************************************************/
+/********************************************************************************************/
+
+static int
+validate_bt_args_local( ControlClient         client,
+                        char                 *args,
+                        struct bt_device_s  **dev )
+{
+    if (!client->bt) {
+        control_write(client, "KO: bluetooth emulation not running\r\n");
+        return -1;
+    }
+
+    *dev = abluetooth_get_bt_device(client->bt);
+    if (!*dev) {
+        control_write(client, "KO: local device is not configurable\r\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+validate_bt_args_bdaddr( ControlClient        client,
+                         char                *args,
+                         struct bt_device_s **dev,
+                         bdaddr_t            *addr,
+                         const bdaddr_t      *default_addr )
+{
+    char *p;
+
+    if (validate_bt_args_local(client, args, dev) < 0) {
+        return -1;
+    }
+
+    if (!args || !(p = strtok(args, " "))) {
+        if (!default_addr) {
+            control_write(client, "KO: missing bluetooth address\r\n");
+            return -1;
+        }
+        bacpy(addr, default_addr);
+    } else if (ba_from_str(addr, p)) {
+        control_write(client, "KO: invalid bluetooth address\r\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+validate_bt_args_device( ControlClient         client,
+                         char                 *args,
+                         struct bt_device_s  **local,
+                         struct bt_device_s  **dev,
+                         bdaddr_t             *addr,
+                         const bdaddr_t       *default_addr,
+                         int                   accept_all )
+{
+    if (validate_bt_args_bdaddr(client, args, local, addr, default_addr) < 0) {
+        return -1;
+    }
+
+    if ((accept_all && !bacmp(addr, BDADDR_ALL)) ||
+        !bacmp(addr, BDADDR_LOCAL) ||
+        !bacmp(addr, &(*local)->bd_addr)) {
+        *dev = *local;
+        return 0;
+    }
+
+    *dev = bt_scatternet_find_slave((*local)->net, addr);
+    if (!*dev) {
+        control_write(client, "KO: device not found\r\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+do_bt_remote_add( ControlClient client, char* args )
+{
+    struct bt_device_s *dev;
+    bdaddr_t addr;
+    char buf[BDADDR_BUF_LEN];
+
+    if (validate_bt_args_local(client, args, &dev) < 0) {
+        return -1;
+    }
+
+    // Create device within dev->net;
+    dev = bt_remote_device_new(dev->net);
+    if (!dev) {
+        control_write(client, "KO: failed to create remote device\r\n");
+        return -1;
+    }
+
+    ba_to_str(buf, &dev->bd_addr);
+    control_write(client, "%s\r\n", buf);
+    return 0;
+}
+
+static int
+do_bt_remote_remove_device( ControlClient        client,
+                            struct bt_device_s  *dev,
+                            int                  fatal )
+{
+    char buf[BDADDR_BUF_LEN];
+
+    if (bt_device_get_property(dev, "is_remote", NULL, 0) < 0) {
+        if (fatal) {
+            control_write(client, "KO: not a remote device\r\n");
+            return -1;
+        }
+        return 0;
+    }
+
+    ba_to_str(buf, &dev->bd_addr);
+    dev->handle_destroy(dev);
+    control_write(client, "%s\r\n", buf);
+
+    return 0;
+}
+
+static void
+do_bt_remote_remove_scatternet( ControlClient            client,
+                                struct bt_scatternet_s  *net )
+{
+    struct bt_device_s *dev, *next;
+
+    dev = net->slave;
+    while (dev) {
+        next = dev->next;
+        do_bt_remote_remove_device(client, dev, 0);
+        dev = next;
+    }
+}
+
+static int
+do_bt_remote_remove( ControlClient client, char* args )
+{
+    struct bt_device_s *local, *dev;
+    bdaddr_t addr;
+
+    if (validate_bt_args_device(client, args, &local, &dev,
+                   &addr, NULL, 1) < 0) {
+        return -1;
+    }
+
+    if (!bacmp(&addr, BDADDR_ALL)) {
+        // Remove all remote devices of current scatter net.
+        do_bt_remote_remove_scatternet(client, local->net);
+        return 0;
+    }
+
+    // Remove only one device.
+    return do_bt_remote_remove_device(client, dev, 1);
+}
+
+static const CommandDefRec bt_remote_commands[] =
+{
+    { "add", "add virtual Bluetooth remote device",
+    "'bt remote add':\r\n"
+    "Add a remote device to the scatternet where the local device lives and return\r\n"
+    "the address of the newly created device.\r\n",
+    NULL, do_bt_remote_add, NULL },
+
+    { "remove", "remove virtual Bluetooth remote device",
+    "'bt remove <bd_addr>':\r\n"
+    "Remove the remote device(s) specified by <bd_addr>.  Use Bluetooth ALL address\r\n"
+    "ff:ff:ff:ff:ff:ff to remove all remote devices the scatternet.\r\n",
+    NULL, do_bt_remote_remove, NULL },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+static void
+do_bt_list_device( ControlClient        client,
+                   struct bt_device_s  *local,
+                   struct bt_device_s  *dev )
+{
+    char buf[BDADDR_BUF_LEN], type;
+
+    if (dev == local) {
+        type = '*';
+    } else if (bt_device_get_property(dev, "is_remote", NULL, 0) >= 0) {
+        type = 'R';
+    } else {
+        type = 'L';
+    }
+    ba_to_str(buf, &dev->bd_addr);
+    control_write(client, "%c %s\r\n", type, buf);
+}
+
+static int
+do_bt_list( ControlClient client, char* args )
+{
+    struct bt_device_s *local, *dev;
+    bdaddr_t addr;
+
+    if (validate_bt_args_device(client, args, &local, &dev,
+                     &addr, BDADDR_ALL, 1) < 0) {
+        return -1;
+    }
+
+    if (!bacmp(&addr, BDADDR_ALL)) {
+        dev = local->net->slave;
+        while (dev) {
+           do_bt_list_device(client, local, dev);
+           dev = dev->next;
+        }
+
+        return 0;
+    }
+
+    do_bt_list_device(client, local, dev);
+    return 0;
+}
+
+static int
+enum_prop_callback(void *opaque, const char *prop, const char *value)
+{
+    control_write((ControlClient)opaque, "%s: %s\r\n", prop, value);
+    return 0;
+}
+
+static int
+do_bt_property( ControlClient client, char* args )
+{
+    struct bt_device_s *local, *dev;
+    bdaddr_t addr;
+    char *p, *v;
+
+    if (validate_bt_args_device(client, args, &local, &dev,
+                    &addr, BDADDR_LOCAL, 0) < 0) {
+        return -1;
+    }
+
+    p = strtok(NULL, " ");
+    if (!p) {
+        return bt_device_enumerate_properties(dev, enum_prop_callback, client);
+    }
+
+    v = strtok(NULL, " ");
+    if (!v) {
+        char buf[1024];
+        if (bt_device_get_property(dev, p, buf, sizeof buf) < 0) {
+            control_write(client, "KO: invalid property '%s'\r\n", p);
+            return -1;
+        }
+
+        control_write(client, "%s: %s\r\n", p, buf);
+        return 0;
+    }
+
+    if (bt_device_set_property(dev, p, v) < 0) {
+        control_write(client, "KO: invalid property '%s' or value '%s'\r\n", p, v);
+        return -1;
+    }
+
+    return 0;
+}
+
+static const CommandDefRec bt_commands[] =
+{
+    { "list", "list scatternet devices",
+    "'bt list [<bd_addr>]':\r\n"
+    "List a device within the same scatternet with current local device. If <bd_addr>\r\n"
+    "is omitted, Bluetooth ALL address ff:ff:ff:ff:ff:ff is assumed.\r\n",
+    NULL, do_bt_list, NULL },
+
+    { "property", "get/set device property",
+    "'bt property [<bd_addr> [<prop> [value]]]':\r\n"
+    "Set property <prop> on device <bd_addr> to <value>.\r\n"
+    "If <value> is omitted, show the property <prop> of device <bd_addr>.\r\n"
+    "If both <prop> and <value> are omitted, enumerate all properties of device\r\n"
+    "<bd_addr>.  If <bd_addr> is also omitted, Bluetooth LOCAL address\r\n"
+    "ff:ff:ff:00:00:00 is assumed.\r\n",
+    NULL, do_bt_property, NULL },
+
+    { "remote", "manage Bluetooth virtual remote devices", NULL,
+    NULL, NULL, bt_remote_commands },
+
+    { NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+/********************************************************************************************/
+/********************************************************************************************/
+/*****                                                                                 ******/
 /*****                           M A I N   C O M M A N D S                             ******/
 /*****                                                                                 ******/
 /********************************************************************************************/
@@ -2982,6 +4344,38 @@ static const CommandDefRec   main_commands[] =
     { "sensor", "manage emulator sensors",
       "allows you to request the emulator sensors\r\n", NULL,
       NULL, sensor_commands },
+
+    { "operator", "manage telephony operator info",
+      "allows you to modify/retrieve telephony operator info\r\n", NULL,
+      NULL, operator_commands },
+
+    { "stk", "STK related commands",
+      "allows you to simulate an inbound STK proactive command\r\n", NULL,
+      NULL, stk_commands },
+
+    { "mux", "device multiplexing management",
+      "allows to select the active device of its kind for console control\r\n", NULL,
+      NULL, mux_commands },
+
+    { "cbs", "Cell Broadcast related commands",
+      "allows you to simulate an inbound CBS\r\n", NULL,
+      NULL, cbs_commands },
+
+    { "rfkill", "RFKILL related commands",
+      "allows you to modify/retrieve RFKILL status, hardware blocking\r\n", NULL,
+      NULL, rfkill_commands },
+
+    { "nfc", "NFC related commands",
+      "allows you to modify/retrieve NFC states and send notifications\r\n", NULL,
+      NULL, nfc_commands },
+
+    { "modem", "Modem related commands",
+      "allows you to modify/retrieve modem info\r\n", NULL,
+      NULL, modem_commands },
+
+    { "bt", "Bluetooth related commands",
+      "allows you to retrieve BT status or add/remove remote devices\r\n", NULL,
+      NULL, bt_commands },
 
     { NULL, NULL, NULL, NULL, NULL, NULL }
 };

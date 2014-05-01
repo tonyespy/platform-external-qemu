@@ -23,6 +23,9 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef QEMU_BT_H
+#define QEMU_BT_H
+
 /* BD Address */
 typedef struct {
     uint8_t b[6];
@@ -46,6 +49,10 @@ static inline void bacpy(bdaddr_t *dst, const bdaddr_t *src)
     (orig)->b[0], (orig)->b[1], (orig)->b[2],	\
     (orig)->b[3], (orig)->b[4], (orig)->b[5],	\
 }, }
+
+int  ba_from_str(bdaddr_t *addr, const char *str);
+#define BDADDR_BUF_LEN  18
+void ba_to_str(char *buf, const bdaddr_t *addr);
 
 /* The twisted structures of a bluetooth environment */
 struct bt_device_s;
@@ -94,6 +101,13 @@ struct bt_device_s {
                     int start, int len);
     void (*lmp_mode_change)(struct bt_link_s *link);
 
+    int (*enumerate_properties)(struct bt_device_s *dev,
+                int(*callback)(void*, const char*, const char*), void *opaque);
+    int (*get_property)(struct bt_device_s *device, const char *property,
+                    char *out_buf, size_t out_len);
+    int (*set_property)(struct bt_device_s *dev, const char *property,
+                    const char *value);
+
     void (*handle_destroy)(struct bt_device_s *device);
     struct bt_device_s *next;	/* Next in the piconet/scatternet */
 
@@ -106,6 +120,19 @@ struct bt_device_s {
 /* bt.c */
 void bt_device_init(struct bt_device_s *dev, struct bt_scatternet_s *net);
 void bt_device_done(struct bt_device_s *dev);
+
+int  _bt_device_enumerate_properties_loop(struct bt_device_s *dev,
+                int(*callback)(void*, const char*, const char*), void *opaque,
+                const char **enumerables, size_t len);
+int  bt_device_enumerate_properties(struct bt_device_s *dev,
+                int(*callback)(void*, const char*, const char*), void *opaque);
+int  bt_device_get_property(struct bt_device_s *dev, const char *property,
+                char *out_buf, size_t out_len);
+int  bt_device_set_property(struct bt_device_s *dev, const char *property,
+                const char *value);
+
+struct bt_device_s *bt_scatternet_find_slave(struct bt_scatternet_s *net,
+                const bdaddr_t *addr);
 
 /* bt-hci.c */
 struct HCIInfo *bt_new_hci(struct bt_scatternet_s *net);
@@ -169,6 +196,16 @@ void bt_l2cap_sdp_init(struct bt_l2cap_device_s *dev);
 struct bt_device_s *bt_mouse_init(struct bt_scatternet_s *net);
 struct bt_device_s *bt_tablet_init(struct bt_scatternet_s *net);
 struct bt_device_s *bt_keyboard_init(struct bt_scatternet_s *net);
+
+/* bt-remote.c */
+struct bt_remote_device_s {
+    struct bt_l2cap_device_s l2cap_dev;
+};
+
+void bt_remote_device_init(struct bt_remote_device_s *dev,
+                struct bt_scatternet_s *net);
+
+struct bt_device_s *bt_remote_device_new(struct bt_scatternet_s *net);
 
 /* Link Management Protocol layer defines */
 
@@ -2181,3 +2218,5 @@ enum bt_sdp_attribute_id {
     SDP_ATTR_NORMALLY_CONNECTABLE		= 0x020d,
     SDP_ATTR_BOOT_DEVICE			= 0x020e,
 };
+
+#endif /* QEMU_BT_H */
